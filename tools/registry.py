@@ -22,6 +22,8 @@ import threading
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set
 
+from agent.tracer import trace_tool
+
 logger = logging.getLogger(__name__)
 
 
@@ -289,6 +291,7 @@ class ToolRegistry:
     # Dispatch
     # ------------------------------------------------------------------
 
+    @trace_tool()
     def dispatch(self, name: str, args: dict, **kwargs) -> str:
         """Execute a tool handler by name.
 

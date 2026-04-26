@@ -82,6 +82,8 @@ import threading
 import time
 from typing import Any, Dict, List, Optional
 
+from agent.tracer import trace_mcp
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -1611,6 +1613,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     ``handler(args_dict, **kwargs) -> str``
     """
 
+    @trace_mcp(server=server_name, tool=tool_name)
     def _handler(args: dict, **kwargs) -> str:
         # Circuit breaker: if this server has failed too many times
         # consecutively, short-circuit with a clear message so the model

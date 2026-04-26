@@ -75,6 +75,7 @@ from tools.tool_result_storage import maybe_persist_tool_result, enforce_turn_bu
 from tools.interrupt import set_interrupt as _set_interrupt
 from tools.browser_tool import cleanup_browser
 
+from agent.tracer import trace_agent_run, trace_llm, trace_tool
 
 from hermes_constants import OPENROUTER_BASE_URL
 
@@ -1883,6 +1884,34 @@ class AIAgent:
                 "anthropic_base_url": self._anthropic_base_url,
                 "is_anthropic_oauth": self._is_anthropic_oauth,
             })
+
+        # Initialize observability tracer if enabled in config.  Safe no-op
+        # when disabled or if anything goes wrong; tracer must never crash
+        # the agent.
+        self._init_tracer()
+
+    def _init_tracer(self):
+        try:
+            from hermes_cli.config import load_config
+            cfg = load_config()
+            obs_cfg = cfg.get("observability", {}) if isinstance(cfg, dict) else {}
+            if not obs_cfg.get("enabled", False):
+                return
+            backend_type = obs_cfg.get("backend", "file")
+            if backend_type == "phoenix":
+                from agent.tracer.backend.phoenix_backend import backend_init
+                backend_init({
+                    "endpoint": obs_cfg.get("phoenix_endpoint", "http://localhost:6006/v1/traces"),
+                    "project_name": obs_cfg.get("phoenix_project", "hermes-agent"),
+                })
+            elif backend_type == "file":
+                from agent.tracer.backend.file_backend import backend_init
+                backend_init({})
+            elif backend_type == "noop":
+                # Default backend is already noop; nothing to do.
+                pass
+        except Exception:
+            logger.debug("Tracer initialization failed, observability disabled", exc_info=True)
 
     def reset_session_state(self):
         """Reset all session-scoped token counters to 0 for a fresh session.
@@ -5814,11 +5843,13 @@ class AIAgent:
 
         return False, has_retried_429
 
+    @trace_llm()
     def _anthropic_messages_create(self, api_kwargs: dict):
         if self.api_mode == "anthropic_messages":
             self._try_refresh_anthropic_client_credentials()
         return self._anthropic_client.messages.create(**api_kwargs)
 
+    @trace_llm()
     def _interruptible_api_call(self, api_kwargs: dict):
         """
         Run the API call in a background thread so the main conversation loop
@@ -6061,6 +6092,7 @@ class AIAgent:
             or getattr(self, "_stream_callback", None) is not None
         )
 
+    @trace_llm()
     def _interruptible_streaming_api_call(
         self, api_kwargs: dict, *, on_first_delta: callable = None
     ):
@@ -8207,6 +8239,7 @@ class AIAgent:
         finally:
             self._executing_tools = False
 
+    @trace_tool()
     def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str,
                      tool_call_id: Optional[str] = None) -> str:
         """Invoke a single tool and return the result string. No display logic.
@@ -9181,6 +9214,13 @@ class AIAgent:
 
         return final_response
 
+    @trace_agent_run(version_provider=lambda self: {
+        "model": getattr(self, "model", ""),
+        "provider": getattr(self, "provider", ""),
+        "platform": getattr(self, "platform", ""),
+        "session_id": getattr(self, "session_id", ""),
+        "app_version": "0.10.0",
+    })
     def run_conversation(
         self,
         user_message: str,
