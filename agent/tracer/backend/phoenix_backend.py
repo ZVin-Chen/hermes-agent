@@ -145,6 +145,13 @@ def _map_attrs(span_type: str, attrs: dict) -> dict:
                 out[A.TOOL_NAME] = _to_oi_attr_value(val)
             elif key == "input" and span_type == "tool":
                 out[A.TOOL_PARAMETERS] = _to_oi_attr_value(val)
+            elif key == "session_id":
+                # OpenInference SESSION_ID = "session.id" — Phoenix uses this
+                # to populate the Sessions view, grouping every trace from a
+                # single hermes session under one navigable list.
+                out[A.SESSION_ID] = _to_oi_attr_value(val)
+            elif key == "user_id":
+                out[A.USER_ID] = _to_oi_attr_value(val)
             else:
                 out[key] = _to_oi_attr_value(val)
         except Exception:
