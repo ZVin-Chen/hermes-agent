@@ -93,7 +93,25 @@ observability = [
   "opentelemetry-sdk>=1.30.0",
   "opentelemetry-exporter-otlp>=1.30.0",
 ]
-all = [
+# Lightweight bundle for development containers focused on observability /
+# tracer work.  Excludes the heavyweights that dominate build time:
+#   - rl       (atroposlib + tinker from git, scientific Python stack)
+#   - voice    (faster-whisper -> ctranslate2 / onnxruntime, source builds on arm64)
+#   - tts-premium / messaging / slack / matrix / dingtalk / feishu / sms /
+#     homeassistant / modal / daytona / bedrock / mistral / yc-bench
+# Keeps everything actually needed to run the CLI, debug Python, and emit
+# Phoenix traces.
+dev-observability = [
+  "hermes-agent[observability]",
+  "hermes-agent[dev]",   # debugpy + pytest, for in-container debugging
+  "hermes-agent[cli]",
+  "hermes-agent[pty]",
+  "hermes-agent[cron]",
+  "hermes-agent[mcp]",
+  "hermes-agent[acp]",
+  "hermes-agent[web]",
+]
+all-no-observability = [
   "hermes-agent[modal]",
   "hermes-agent[daytona]",
   "hermes-agent[messaging]",
@@ -118,6 +136,9 @@ all = [
   "hermes-agent[mistral]",
   "hermes-agent[bedrock]",
   "hermes-agent[web]",
+]
+all = [
+  "hermes-agent[all-no-observability]",
   "hermes-agent[observability]",
 ]
 

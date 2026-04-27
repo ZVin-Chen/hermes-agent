@@ -31,6 +31,18 @@ _CC_RE = re.compile(r"\b(?:\d[ -]*?){13,16}\b")
 
 
 @dataclass
+class SpanEvent:
+    """A timestamped point-in-time annotation on a Span (OTel data model layer 3).
+
+    Distinct from a child span: events have no duration, they mark *when*
+    something happened inside an enclosing span.
+    """
+    name: str
+    timestamp: float
+    attrs: dict = field(default_factory=dict)
+
+
+@dataclass
 class Span:
     span_id: str
     span_type: str
@@ -41,6 +53,7 @@ class Span:
     start_time: float = 0.0
     end_time: Optional[float] = None
     backend_handle: Any = None
+    events: list = field(default_factory=list)
 
     @property
     def duration_ms(self) -> Optional[float]:
@@ -56,6 +69,32 @@ class Span:
             backend_set_attrs(self.backend_handle, {key: value})
         except Exception:
             logger.debug("backend_set_attrs failed", exc_info=True)
+
+    def add_event(self, name: str, **attrs: Any) -> None:
+        """Attach a SpanEvent to this span and forward to the backend."""
+        ts = time.time()
+        evt = SpanEvent(name=name, timestamp=ts, attrs=dict(attrs))
+        self.events.append(evt)
+        try:
+            from agent.tracer.backend import backend_add_event
+
+            backend_add_event(self.backend_handle, name, evt.attrs, ts)
+        except Exception:
+            logger.debug("backend_add_event failed", exc_info=True)
+
+
+def add_event(name: str, **attrs: Any) -> None:
+    """Module-level helper: attach an event to whatever span is currently active.
+
+    No-op when no span is active.  Safe to call from anywhere — never raises.
+    """
+    sp = _current_span.get()
+    if sp is None:
+        return
+    try:
+        sp.add_event(name, **attrs)
+    except Exception:
+        logger.debug("add_event failed", exc_info=True)
 
 
 _current_span: ContextVar[Optional[Span]] = ContextVar("_current_span", default=None)
@@ -169,6 +208,28 @@ def span(span_type: str, name: str, **attrs: Any) -> Iterator[Span]:
         _current_span.set(prev)
 
 
+def _resolve_span_name(template: str, bound: dict) -> str:
+    """Render ``{placeholder}`` references in *template* using bound args.
+
+    Falls back to the literal template if anything goes wrong (missing key,
+    unhashable arg, etc.) so a malformed name never breaks the call.
+    """
+    if not template or "{" not in template:
+        return template
+    try:
+        return template.format(**bound)
+    except Exception:
+        # Try a tolerant pass: replace only the placeholders we can resolve,
+        # leave the rest as-is.
+        try:
+            class _Tolerant(dict):
+                def __missing__(self, key):  # noqa: D401
+                    return "{" + key + "}"
+            return template.format_map(_Tolerant(**bound))
+        except Exception:
+            return template
+
+
 def _bind_args(func: Callable, args: tuple, kwargs: dict) -> dict:
     try:
         sig = inspect.signature(func)
@@ -224,7 +285,7 @@ def trace(
                 init_attrs = _resolve_attrs(attrs_extractor, bound)
                 if capture_input:
                     init_attrs.setdefault("input", _safe_serialize(**bound))
-                with span(span_type, span_name, **init_attrs) as sp:
+                with span(span_type, _resolve_span_name(span_name, bound), **init_attrs) as sp:
                     started = time.time()
                     first = True
                     chunks: list = []
@@ -259,7 +320,7 @@ def trace(
                 init_attrs = _resolve_attrs(attrs_extractor, bound)
                 if capture_input:
                     init_attrs.setdefault("input", _safe_serialize(**bound))
-                with span(span_type, span_name, **init_attrs) as sp:
+                with span(span_type, _resolve_span_name(span_name, bound), **init_attrs) as sp:
                     result = await func(*args, **kwargs)
                     if capture_output:
                         sp.set_attr("output", _safe_value(result))
@@ -280,7 +341,7 @@ def trace(
                 init_attrs = _resolve_attrs(attrs_extractor, bound)
                 if capture_input:
                     init_attrs.setdefault("input", _safe_serialize(**bound))
-                with span(span_type, span_name, **init_attrs) as sp:
+                with span(span_type, _resolve_span_name(span_name, bound), **init_attrs) as sp:
                     chunks: list = []
                     gen = func(*args, **kwargs)
                     try:
@@ -305,7 +366,7 @@ def trace(
             init_attrs = _resolve_attrs(attrs_extractor, bound)
             if capture_input:
                 init_attrs.setdefault("input", _safe_serialize(**bound))
-            with span(span_type, span_name, **init_attrs) as sp:
+            with span(span_type, _resolve_span_name(span_name, bound), **init_attrs) as sp:
                 result = func(*args, **kwargs)
                 if capture_output:
                     sp.set_attr("output", _safe_value(result))

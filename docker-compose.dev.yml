@@ -1,0 +1,67 @@
+# Dev / debug topology for the agent-observability worktree.
+#
+#   docker compose -f docker-compose.dev.yml up -d phoenix
+#   docker compose -f docker-compose.dev.yml run --rm hermes
+#
+# Phoenix UI:  http://localhost:6006
+#
+# Both services bind-mount to ./.docker-data/ on the host so trace data,
+# Hermes config, sessions, and logs survive container destruction.
+
+services:
+  phoenix:
+    image: arizephoenix/phoenix:latest
+    container_name: hermes-dev-phoenix
+    restart: unless-stopped
+    ports:
+      - "6006:6006"   # only for browser access to the UI; hermes uses
+                      # the in-network address http://phoenix:6006
+    environment:
+      # Persist SQLite + traces under the bind-mounted dir.
+      - PHOENIX_WORKING_DIR=/mnt/phoenix
+    volumes:
+      - ./.docker-data/phoenix:/mnt/phoenix
+    # No healthcheck — the Phoenix image is distroless (no shell, curl, or
+    # python), so we can't probe from inside.  hermes uses depends_on:
+    # service_started; Phoenix starts in <2s and the OTel BatchSpanProcessor
+    # tolerates a few initial failed pushes without affecting the agent.
+
+  hermes:
+    build:
+      context: .
+      args:
+        # Slim dev bundle: observability + cli essentials + debugpy/pytest.
+        # Excludes the heavy extras (rl/voice/messaging/...) that dominate
+        # build time and image size but aren't needed for tracer debugging.
+        HERMES_EXTRAS: dev-observability
+    image: hermes-dev:obs
+    container_name: hermes-dev
+    depends_on:
+      phoenix:
+        condition: service_started
+    stdin_open: true
+    tty: true
+    # Match host UID/GID so files created in the bind mount are owned by you.
+    environment:
+      - HERMES_UID=${HERMES_UID:-1000}
+      - HERMES_GID=${HERMES_GID:-1000}
+      - HERMES_LOG_LEVEL=${HERMES_LOG_LEVEL:-INFO}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+    volumes:
+      # Source code (editable install reads from here — no rebuild on .py edits)
+      - .:/opt/hermes
+      # Anonymous volumes mask subpaths so the build-time artifacts in the
+      # image are not hidden by the bind mount above.  Without these, the
+      # empty host-side .venv / node_modules would shadow the populated
+      # versions baked into the image.
+      - /opt/hermes/.venv
+      - /opt/hermes/node_modules
+      - /opt/hermes/web/node_modules
+      - /opt/hermes/hermes_cli/web_dist
+      - /opt/hermes/.playwright
+      - /opt/hermes/hermes_agent.egg-info
+      # HERMES_HOME — config, sessions, logs, memories, skills, ~/.hermes equivalent
+      - ./.docker-data/hermes-home:/opt/data
+
+volumes: {}

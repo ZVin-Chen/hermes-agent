@@ -85,10 +85,27 @@ def backend_set_attrs(handle: Any, attrs: dict) -> None:
         logger.debug("backend_set_attrs failed", exc_info=True)
 
 
+def backend_add_event(handle: Any, name: str, attrs: dict, timestamp: float) -> None:
+    """Attach a SpanEvent to the active span (OTel data model layer 3).
+
+    *timestamp* is a unix epoch seconds float; backends adapt to their own
+    precision (Phoenix/OTel uses nanoseconds).
+    """
+    _ensure_default()
+    fn = getattr(_active_backend, "backend_add_event", None)
+    if fn is None:
+        return  # backend doesn't implement events — silently skip
+    try:
+        fn(handle, name, attrs, timestamp)
+    except Exception:
+        logger.debug("backend_add_event failed", exc_info=True)
+
+
 __all__ = [
     "set_backend",
     "backend_init",
     "backend_start_span",
     "backend_end_span",
     "backend_set_attrs",
+    "backend_add_event",
 ]

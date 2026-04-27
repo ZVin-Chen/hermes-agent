@@ -212,6 +212,22 @@ def backend_set_attrs(handle: Any, attrs: dict) -> None:
         logger.debug("phoenix backend_set_attrs failed", exc_info=True)
 
 
+def backend_add_event(handle: Any, name: str, attrs: dict, timestamp: float) -> None:
+    """Forward a SpanEvent to the underlying OTel span.
+
+    OTel's add_event takes timestamp in nanoseconds; we receive seconds.
+    Phoenix's UI shows events as point markers on the span timeline.
+    """
+    if handle is None:
+        return
+    try:
+        attributes = {k: _to_oi_attr_value(v) for k, v in attrs.items()}
+        ts_ns = int(timestamp * 1_000_000_000)
+        handle.span.add_event(name, attributes=attributes, timestamp=ts_ns)
+    except Exception:
+        logger.debug("phoenix backend_add_event failed", exc_info=True)
+
+
 def backend_end_span(handle: Any, attrs: dict) -> None:
     if handle is None:
         return

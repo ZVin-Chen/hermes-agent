@@ -21,11 +21,19 @@ def _get(d: dict, *keys: str, default: Any = None) -> Any:
     return default
 
 
-def trace_llm(model: Optional[str] = None, capture_messages: bool = True):
+def trace_llm(
+    model: Optional[str] = None,
+    capture_messages: bool = True,
+    name: Optional[str] = "llm.completion",
+):
     """Decorator for LLM calls.
 
     Extracts model name, messages, output, usage tokens, stop reason and
     temperature from the function's bound args / result.
+
+    *name* controls the span name shown in trace UIs.  Defaults to
+    ``"llm.completion"``; pass ``name="llm.{model}"`` (or any other format
+    string) to embed bound-arg values.
     """
 
     def extractor(bound: dict, result: Any = None) -> dict:
@@ -83,7 +91,7 @@ def trace_llm(model: Optional[str] = None, capture_messages: bool = True):
                         pass
         return out
 
-    return trace("llm", capture_input=False, capture_output=False, attrs_extractor=extractor)
+    return trace("llm", name=name, capture_input=False, capture_output=False, attrs_extractor=extractor)
 
 
 def trace_tool(name: Optional[str] = None, has_side_effect: bool = False):
@@ -163,8 +171,14 @@ def trace_reasoning(name: Optional[str] = None):
     return trace("chain", name=name)
 
 
-def trace_agent_run(version_provider: Optional[Callable[[], dict]] = None):
-    """Decorator for the top-level agent run."""
+def trace_agent_run(
+    version_provider: Optional[Callable[[], dict]] = None,
+    name: Optional[str] = "agent.run",
+):
+    """Decorator for the top-level agent run.
+
+    *name* is the human-readable span name (defaults to ``"agent.run"``).
+    """
 
     def extractor(bound: dict, result: Any = None) -> dict:
         out: dict = {}
@@ -186,7 +200,7 @@ def trace_agent_run(version_provider: Optional[Callable[[], dict]] = None):
             out["user_message"] = user_msg
         return out
 
-    return trace("agent", capture_input=False, capture_output=True, attrs_extractor=extractor)
+    return trace("agent", name=name, capture_input=False, capture_output=True, attrs_extractor=extractor)
 
 
 __all__ = [

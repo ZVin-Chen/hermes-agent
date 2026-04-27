@@ -26,3 +26,7 @@ def backend_end_span(handle: Any, attrs: dict) -> None:
 
 def backend_set_attrs(handle: Any, attrs: dict) -> None:
     return None
+
+
+def backend_add_event(handle: Any, name: str, attrs: dict, timestamp: float) -> None:
+    return None

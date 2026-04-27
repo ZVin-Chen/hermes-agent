@@ -291,7 +291,7 @@ class ToolRegistry:
     # Dispatch
     # ------------------------------------------------------------------
 
-    @trace_tool()
+    @trace_tool(name="tool.{name}")
     def dispatch(self, name: str, args: dict, **kwargs) -> str:
         """Execute a tool handler by name.
 

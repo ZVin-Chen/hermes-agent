@@ -55,7 +55,7 @@ def _rotate_if_needed(path: Path) -> None:
 
 
 class _Handle:
-    __slots__ = ("span_id", "parent_id", "trace_id", "span_type", "name", "attrs", "start_time")
+    __slots__ = ("span_id", "parent_id", "trace_id", "span_type", "name", "attrs", "start_time", "events")
 
     def __init__(self, span_id, parent_id, trace_id, span_type, name, attrs, start_time):
         self.span_id = span_id
@@ -65,6 +65,7 @@ class _Handle:
         self.name = name
         self.attrs = dict(attrs)
         self.start_time = start_time
+        self.events: list = []
 
 
 def backend_start_span(
@@ -84,6 +85,17 @@ def backend_set_attrs(handle: Any, attrs: dict) -> None:
     handle.attrs.update(attrs)
 
 
+def backend_add_event(handle: Any, name: str, attrs: dict, timestamp: float) -> None:
+    """Buffer the event on the handle; written out alongside the span on end."""
+    if handle is None:
+        return
+    handle.events.append({
+        "name": name,
+        "timestamp": timestamp,
+        "attrs": dict(attrs),
+    })
+
+
 def backend_end_span(handle: Any, attrs: dict) -> None:
     if handle is None or _log_path is None:
         return
@@ -97,6 +109,7 @@ def backend_end_span(handle: Any, attrs: dict) -> None:
         "attrs": {**handle.attrs, **attrs},
         "start_time": handle.start_time,
         "duration_ms": (end - handle.start_time) * 1000.0,
+        "events": list(handle.events),
     }
     line = json.dumps(record, default=str, ensure_ascii=False)
     with _lock:

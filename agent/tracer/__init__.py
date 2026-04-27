@@ -8,7 +8,7 @@ Business code should import only from this module:
 import contextvars
 from contextlib import contextmanager
 
-from agent.tracer.core import Span, _trace_source, current_span, span, trace
+from agent.tracer.core import Span, SpanEvent, _trace_source, add_event, current_span, span, trace
 from agent.tracer.decorators import (
     trace_agent_run,
     trace_llm,
@@ -41,6 +41,8 @@ def trace_source(source: str):
 
 __all__ = [
     "Span",
+    "SpanEvent",
+    "add_event",
     "span",
     "trace",
     "trace_agent_run",
