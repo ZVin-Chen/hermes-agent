@@ -68,3 +68,6 @@ mini-swe-agent/
 .nix-stamps/
 result
 website/static/api/skills-index.json
+
+# Local Docker dev runtime data (HERMES_HOME bind mount, Phoenix store, secrets)
+.docker-data/

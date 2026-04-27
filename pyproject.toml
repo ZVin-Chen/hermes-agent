@@ -87,7 +87,31 @@ rl = [
   "wandb>=0.15.0,<1",
 ]
 yc-bench = ["yc-bench @ git+https://github.com/collinear-ai/yc-bench.git@bfb0c88062450f46341bd9a5298903fc2e952a5c ; python_version >= '3.12'"]
-all = [
+observability = [
+  "arize-phoenix>=8.0.0",
+  "openinference-instrumentation>=0.1.0",
+  "opentelemetry-sdk>=1.30.0",
+  "opentelemetry-exporter-otlp>=1.30.0",
+]
+# Lightweight bundle for development containers focused on observability /
+# tracer work.  Excludes the heavyweights that dominate build time:
+#   - rl       (atroposlib + tinker from git, scientific Python stack)
+#   - voice    (faster-whisper -> ctranslate2 / onnxruntime, source builds on arm64)
+#   - tts-premium / messaging / slack / matrix / dingtalk / feishu / sms /
+#     homeassistant / modal / daytona / bedrock / mistral / yc-bench
+# Keeps everything actually needed to run the CLI, debug Python, and emit
+# Phoenix traces.
+dev-observability = [
+  "hermes-agent[observability]",
+  "hermes-agent[dev]",   # debugpy + pytest, for in-container debugging
+  "hermes-agent[cli]",
+  "hermes-agent[pty]",
+  "hermes-agent[cron]",
+  "hermes-agent[mcp]",
+  "hermes-agent[acp]",
+  "hermes-agent[web]",
+]
+all-no-observability = [
   "hermes-agent[modal]",
   "hermes-agent[daytona]",
   "hermes-agent[messaging]",
@@ -112,6 +136,10 @@ all = [
   "hermes-agent[mistral]",
   "hermes-agent[bedrock]",
   "hermes-agent[web]",
+]
+all = [
+  "hermes-agent[all-no-observability]",
+  "hermes-agent[observability]",
 ]
 
 [project.scripts]

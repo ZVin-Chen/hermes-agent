@@ -23,6 +23,7 @@ Usage:
 import asyncio
 import base64
 import concurrent.futures
+import contextvars
 import copy
 import hashlib
 import json
@@ -75,6 +76,8 @@ from tools.tool_result_storage import maybe_persist_tool_result, enforce_turn_bu
 from tools.interrupt import set_interrupt as _set_interrupt
 from tools.browser_tool import cleanup_browser
 
+from agent.tracer import trace_agent_run, trace_llm, trace_tool, span as _tracer_span
+from tools.registry import registry as _tool_registry
 
 from hermes_constants import OPENROUTER_BASE_URL
 
@@ -1883,6 +1886,34 @@ class AIAgent:
                 "anthropic_base_url": self._anthropic_base_url,
                 "is_anthropic_oauth": self._is_anthropic_oauth,
             })
+
+        # Initialize observability tracer if enabled in config.  Safe no-op
+        # when disabled or if anything goes wrong; tracer must never crash
+        # the agent.
+        self._init_tracer()
+
+    def _init_tracer(self):
+        try:
+            from hermes_cli.config import load_config
+            cfg = load_config()
+            obs_cfg = cfg.get("observability", {}) if isinstance(cfg, dict) else {}
+            if not obs_cfg.get("enabled", False):
+                return
+            backend_type = obs_cfg.get("backend", "file")
+            if backend_type == "phoenix":
+                from agent.tracer.backend.phoenix_backend import backend_init
+                backend_init({
+                    "endpoint": obs_cfg.get("phoenix_endpoint", "http://localhost:6006/v1/traces"),
+                    "project_name": obs_cfg.get("phoenix_project", "hermes-agent"),
+                })
+            elif backend_type == "file":
+                from agent.tracer.backend.file_backend import backend_init
+                backend_init({})
+            elif backend_type == "noop":
+                # Default backend is already noop; nothing to do.
+                pass
+        except Exception:
+            logger.debug("Tracer initialization failed, observability disabled", exc_info=True)
 
     def reset_session_state(self):
         """Reset all session-scoped token counters to 0 for a fresh session.
@@ -5814,11 +5845,13 @@ class AIAgent:
 
         return False, has_retried_429
 
+    @trace_llm()
     def _anthropic_messages_create(self, api_kwargs: dict):
         if self.api_mode == "anthropic_messages":
             self._try_refresh_anthropic_client_credentials()
         return self._anthropic_client.messages.create(**api_kwargs)
 
+    @trace_llm()
     def _interruptible_api_call(self, api_kwargs: dict):
         """
         Run the API call in a background thread so the main conversation loop
@@ -5881,7 +5914,11 @@ class AIAgent:
         _call_start = time.time()
         self._touch_activity("waiting for non-streaming API response")
 
-        t = threading.Thread(target=_call, daemon=True)
+        # Propagate the caller's contextvars (notably the active LLM span)
+        # so add_event() inside the worker thread can attach SpanEvents to
+        # the right span instead of falling back to no-op.
+        _llm_ctx = contextvars.copy_context()
+        t = threading.Thread(target=_llm_ctx.run, args=(_call,), daemon=True)
         t.start()
         _poll_count = 0
         while t.is_alive():
@@ -6061,6 +6098,7 @@ class AIAgent:
             or getattr(self, "_stream_callback", None) is not None
         )
 
+    @trace_llm()
     def _interruptible_streaming_api_call(
         self, api_kwargs: dict, *, on_first_delta: callable = None
     ):
@@ -6158,13 +6196,28 @@ class AIAgent:
         # SSE keep-alive pings but no actual data.
         last_chunk_time = {"t": time.time()}
 
+        # Captured at function entry so the SpanEvent's TTFT is measured
+        # against the moment the LLM call started, not the first delta.
+        _llm_call_started = time.time()
+
         def _fire_first_delta():
-            if not first_delta_fired["done"] and on_first_delta:
+            if not first_delta_fired["done"]:
                 first_delta_fired["done"] = True
+                # SpanEvent: time-to-first-token marks the latency between
+                # request send and the model's first streamed token.
                 try:
-                    on_first_delta()
+                    from agent.tracer import add_event as _add_event
+                    _add_event(
+                        "llm.first_token",
+                        ttft_ms=(time.time() - _llm_call_started) * 1000.0,
+                    )
                 except Exception:
                     pass
+                if on_first_delta:
+                    try:
+                        on_first_delta()
+                    except Exception:
+                        pass
 
         def _call_chat_completions():
             """Stream a chat completions response."""
@@ -6624,7 +6677,11 @@ class AIAgent:
             else:
                 _stream_stale_timeout = _stream_stale_timeout_base
 
-        t = threading.Thread(target=_call, daemon=True)
+        # Propagate the caller's contextvars (notably the active LLM span)
+        # so add_event() inside the worker thread can attach SpanEvents to
+        # the right span instead of falling back to no-op.
+        _llm_ctx = contextvars.copy_context()
+        t = threading.Thread(target=_llm_ctx.run, args=(_call,), daemon=True)
         t.start()
         _last_heartbeat = time.time()
         _HEARTBEAT_INTERVAL = 30.0  # seconds between gateway activity touches
@@ -8112,6 +8169,20 @@ class AIAgent:
 
         compressed = self.context_compressor.compress(messages, current_tokens=approx_tokens, focus_topic=focus_topic)
 
+        # SpanEvent: record that compression actually happened, with the
+        # before/after message counts so timeline tools can mark this point.
+        try:
+            from agent.tracer import add_event as _add_event
+            _add_event(
+                "agent.context_compressed",
+                messages_before=_pre_msg_count,
+                messages_after=len(compressed),
+                approx_tokens=approx_tokens or 0,
+                focus_topic=focus_topic or "",
+            )
+        except Exception:
+            pass
+
         todo_snapshot = self._todo_store.format_for_injection()
         if todo_snapshot:
             compressed.append({"role": "user", "content": todo_snapshot})
@@ -8211,9 +8282,11 @@ class AIAgent:
                      tool_call_id: Optional[str] = None) -> str:
         """Invoke a single tool and return the result string. No display logic.
 
-        Handles both agent-level tools (todo, memory, etc.) and registry-dispatched
-        tools. Used by the concurrent execution path; the sequential path retains
-        its own inline invocation for backward-compatible display handling.
+        Tracing: every branch routes through ``ToolRegistry.dispatch`` (for
+        registry-registered tools) or wraps in a manual ``_tracer_span``
+        (for non-registry agent-level subsystems like the memory provider),
+        so each tool call produces exactly one ``[tool]`` span nested under
+        the active ``agent.run`` parent.
         """
         # Check plugin hooks for a block directive before executing anything.
         block_message: Optional[str] = None
@@ -8228,32 +8301,20 @@ class AIAgent:
             return json.dumps({"error": block_message}, ensure_ascii=False)
 
         if function_name == "todo":
-            from tools.todo_tool import todo_tool as _todo_tool
-            return _todo_tool(
-                todos=function_args.get("todos"),
-                merge=function_args.get("merge", False),
-                store=self._todo_store,
+            return _tool_registry.dispatch(
+                "todo", function_args, store=self._todo_store,
             )
         elif function_name == "session_search":
             if not self._session_db:
                 return json.dumps({"success": False, "error": "Session database not available."})
-            from tools.session_search_tool import session_search as _session_search
-            return _session_search(
-                query=function_args.get("query", ""),
-                role_filter=function_args.get("role_filter"),
-                limit=function_args.get("limit", 3),
-                db=self._session_db,
-                current_session_id=self.session_id,
+            return _tool_registry.dispatch(
+                "session_search", function_args,
+                db=self._session_db, current_session_id=self.session_id,
             )
         elif function_name == "memory":
             target = function_args.get("target", "memory")
-            from tools.memory_tool import memory_tool as _memory_tool
-            result = _memory_tool(
-                action=function_args.get("action"),
-                target=target,
-                content=function_args.get("content"),
-                old_text=function_args.get("old_text"),
-                store=self._memory_store,
+            result = _tool_registry.dispatch(
+                "memory", function_args, store=self._memory_store,
             )
             # Bridge: notify external memory provider of built-in memory writes
             if self._memory_manager and function_args.get("action") in ("add", "replace"):
@@ -8267,23 +8328,17 @@ class AIAgent:
                     pass
             return result
         elif self._memory_manager and self._memory_manager.has_tool(function_name):
-            return self._memory_manager.handle_tool_call(function_name, function_args)
+            # External memory-provider tools are not in the registry — wrap
+            # manually so they still appear in traces.
+            with _tracer_span("tool", f"tool.{function_name}", **{"tool.name": function_name}):
+                return self._memory_manager.handle_tool_call(function_name, function_args)
         elif function_name == "clarify":
-            from tools.clarify_tool import clarify_tool as _clarify_tool
-            return _clarify_tool(
-                question=function_args.get("question", ""),
-                choices=function_args.get("choices"),
-                callback=self.clarify_callback,
+            return _tool_registry.dispatch(
+                "clarify", function_args, callback=self.clarify_callback,
             )
         elif function_name == "delegate_task":
-            from tools.delegate_tool import delegate_task as _delegate_task
-            return _delegate_task(
-                goal=function_args.get("goal"),
-                context=function_args.get("context"),
-                toolsets=function_args.get("toolsets"),
-                tasks=function_args.get("tasks"),
-                max_iterations=function_args.get("max_iterations"),
-                parent_agent=self,
+            return _tool_registry.dispatch(
+                "delegate_task", function_args, parent_agent=self,
             )
         else:
             return handle_function_call(
@@ -8481,7 +8536,13 @@ class AIAgent:
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = []
                 for i, (tc, name, args) in enumerate(parsed_calls):
-                    f = executor.submit(_run_tool, i, tc, name, args)
+                    # Copy the caller's contextvars (notably the tracer's
+                    # _current_span) into the worker so @trace_tool spans
+                    # nest under the active agent.run instead of starting
+                    # fresh trace_ids.  ThreadPoolExecutor.submit does not
+                    # propagate context by default.
+                    ctx = contextvars.copy_context()
+                    f = executor.submit(ctx.run, _run_tool, i, tc, name, args)
                     futures.append(f)
 
                 # Wait for all to complete with periodic heartbeats so the
@@ -8742,11 +8803,8 @@ class AIAgent:
                 function_result = json.dumps({"error": _block_msg}, ensure_ascii=False)
                 tool_duration = 0.0
             elif function_name == "todo":
-                from tools.todo_tool import todo_tool as _todo_tool
-                function_result = _todo_tool(
-                    todos=function_args.get("todos"),
-                    merge=function_args.get("merge", False),
-                    store=self._todo_store,
+                function_result = _tool_registry.dispatch(
+                    "todo", function_args, store=self._todo_store,
                 )
                 tool_duration = time.time() - tool_start_time
                 if self._should_emit_quiet_tool_messages():
@@ -8755,26 +8813,17 @@ class AIAgent:
                 if not self._session_db:
                     function_result = json.dumps({"success": False, "error": "Session database not available."})
                 else:
-                    from tools.session_search_tool import session_search as _session_search
-                    function_result = _session_search(
-                        query=function_args.get("query", ""),
-                        role_filter=function_args.get("role_filter"),
-                        limit=function_args.get("limit", 3),
-                        db=self._session_db,
-                        current_session_id=self.session_id,
+                    function_result = _tool_registry.dispatch(
+                        "session_search", function_args,
+                        db=self._session_db, current_session_id=self.session_id,
                     )
                 tool_duration = time.time() - tool_start_time
                 if self._should_emit_quiet_tool_messages():
                     self._vprint(f"  {_get_cute_tool_message_impl('session_search', function_args, tool_duration, result=function_result)}")
             elif function_name == "memory":
                 target = function_args.get("target", "memory")
-                from tools.memory_tool import memory_tool as _memory_tool
-                function_result = _memory_tool(
-                    action=function_args.get("action"),
-                    target=target,
-                    content=function_args.get("content"),
-                    old_text=function_args.get("old_text"),
-                    store=self._memory_store,
+                function_result = _tool_registry.dispatch(
+                    "memory", function_args, store=self._memory_store,
                 )
                 # Bridge: notify external memory provider of built-in memory writes
                 if self._memory_manager and function_args.get("action") in ("add", "replace"):
@@ -8790,17 +8839,13 @@ class AIAgent:
                 if self._should_emit_quiet_tool_messages():
                     self._vprint(f"  {_get_cute_tool_message_impl('memory', function_args, tool_duration, result=function_result)}")
             elif function_name == "clarify":
-                from tools.clarify_tool import clarify_tool as _clarify_tool
-                function_result = _clarify_tool(
-                    question=function_args.get("question", ""),
-                    choices=function_args.get("choices"),
-                    callback=self.clarify_callback,
+                function_result = _tool_registry.dispatch(
+                    "clarify", function_args, callback=self.clarify_callback,
                 )
                 tool_duration = time.time() - tool_start_time
                 if self._should_emit_quiet_tool_messages():
                     self._vprint(f"  {_get_cute_tool_message_impl('clarify', function_args, tool_duration, result=function_result)}")
             elif function_name == "delegate_task":
-                from tools.delegate_tool import delegate_task as _delegate_task
                 tasks_arg = function_args.get("tasks")
                 if tasks_arg and isinstance(tasks_arg, list):
                     spinner_label = f"🔀 delegating {len(tasks_arg)} tasks"
@@ -8815,13 +8860,8 @@ class AIAgent:
                 self._delegate_spinner = spinner
                 _delegate_result = None
                 try:
-                    function_result = _delegate_task(
-                        goal=function_args.get("goal"),
-                        context=function_args.get("context"),
-                        toolsets=function_args.get("toolsets"),
-                        tasks=tasks_arg,
-                        max_iterations=function_args.get("max_iterations"),
-                        parent_agent=self,
+                    function_result = _tool_registry.dispatch(
+                        "delegate_task", function_args, parent_agent=self,
                     )
                     _delegate_result = function_result
                 finally:
@@ -8843,7 +8883,8 @@ class AIAgent:
                     spinner.start()
                 _ce_result = None
                 try:
-                    function_result = self.context_compressor.handle_tool_call(function_name, function_args, messages=messages)
+                    with _tracer_span("tool", f"tool.{function_name}", **{"tool.name": function_name}):
+                        function_result = self.context_compressor.handle_tool_call(function_name, function_args, messages=messages)
                     _ce_result = function_result
                 except Exception as tool_error:
                     function_result = json.dumps({"error": f"Context engine tool '{function_name}' failed: {tool_error}"})
@@ -8867,7 +8908,8 @@ class AIAgent:
                     spinner.start()
                 _mem_result = None
                 try:
-                    function_result = self._memory_manager.handle_tool_call(function_name, function_args)
+                    with _tracer_span("tool", f"tool.{function_name}", **{"tool.name": function_name}):
+                        function_result = self._memory_manager.handle_tool_call(function_name, function_args)
                     _mem_result = function_result
                 except Exception as tool_error:
                     function_result = json.dumps({"error": f"Memory tool '{function_name}' failed: {tool_error}"})
@@ -9181,6 +9223,13 @@ class AIAgent:
 
         return final_response
 
+    @trace_agent_run(version_provider=lambda self: {
+        "model": getattr(self, "model", ""),
+        "provider": getattr(self, "provider", ""),
+        "platform": getattr(self, "platform", ""),
+        "session_id": getattr(self, "session_id", ""),
+        "app_version": "0.10.0",
+    })
     def run_conversation(
         self,
         user_message: str,

@@ -828,8 +828,20 @@ DEFAULT_CONFIG = {
         "force_ipv4": False,
     },
 
+    # Observability / tracing.  When enabled, AIAgent installs the chosen
+    # tracer backend at startup; spans are produced via decorators in
+    # `agent.tracer`.  Backend can be swapped without code changes.
+    "observability": {
+        "enabled": False,
+        "backend": "file",  # "file" | "phoenix" | "noop"
+        "phoenix_endpoint": "http://localhost:6006/v1/traces",
+        "phoenix_project": "hermes-agent",
+        "sample_rate": 1.0,
+        "max_attr_length": 10000,
+    },
+
     # Config schema version - bump this when adding new required fields
-    "_config_version": 21,
+    "_config_version": 22,
 }
 
 # =============================================================================
